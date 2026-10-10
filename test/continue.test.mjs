@@ -7,7 +7,7 @@ const I = require('../src/index.js').__internals
 const {
   reasonKind, computeBackoff, withinCooldown, isExcluded,
   decideTurnEnd, classifyFailure, firstMatchingRule, sanitizeRule, sanitizePatch,
-  newSessionState, DEFAULTS, DEFAULT_RULES,
+  newSessionState, DEFAULTS, DEFAULT_RULES, RULE_WHENS,
 } = I
 
 const eff = (over = {}) => ({ ...DEFAULTS, ...over })
@@ -232,11 +232,18 @@ test('sanitizePatch: rules sanitized, garbage dropped; legacy keys ignored', () 
 test('DEFAULTS: rule-driven settings with sensible default table', () => {
   assert.equal(DEFAULTS.maxAttempts, 50)
   assert.equal(DEFAULTS.enabled, true)
-  assert.ok(Array.isArray(DEFAULTS.rules) && DEFAULTS.rules.length === 6)
+  assert.ok(Array.isArray(DEFAULTS.rules) && DEFAULTS.rules.length === 7)
   assert.equal(DEFAULT_RULES[0].when, 'rate-limit')
   assert.equal(DEFAULT_RULES[0].action, 'continue')
   assert.equal(DEFAULT_RULES[1].when, 'quota')
   assert.equal(DEFAULT_RULES[1].action, 'stop')
+  // max-tokens 在 interrupted 之后、any 之前，默认不限次（由全局上限/冷却/退避兜底）
+  assert.equal(DEFAULT_RULES[5].id, 'r-max-tokens')
+  assert.equal(DEFAULT_RULES[5].when, 'max-tokens')
+  assert.equal(DEFAULT_RULES[5].action, 'continue')
+  assert.equal(DEFAULT_RULES[5].maxAttempts, 0)
+  assert.equal(DEFAULT_RULES[6].when, 'any')
+  assert.ok(RULE_WHENS.indexOf('max-tokens') === RULE_WHENS.indexOf('interrupted') + 1)
 })
 
 // ── sequence: cap then completed-resets ──────────────────────────────────
@@ -343,4 +350,71 @@ test('decideTurnEnd: custom status rule routes and carries its action payload', 
   // 状态码不在列表内 → 无规则可用 → cap
   const b = decideTurnEnd(newSessionState(), 'error', e, 1000, { code: 'QUOTA', status: 402, message: 'x' })
   assert.equal(b.type, 'cap')
+})
+
+// ── max-tokens（输出截断）────────────────────────────────────────────────
+
+test('classToWhen: max-tokens maps to its own when; aborted/completed stay undefined', () => {
+  const { classToWhen } = I
+  assert.equal(classToWhen('max-tokens'), 'max-tokens')
+  assert.equal(classToWhen('interrupted'), 'interrupted')
+  assert.equal(classToWhen('aborted'), undefined)
+  assert.equal(classToWhen('completed'), undefined)
+})
+
+test('decideTurnEnd: max-tokens schedules r-max-tokens by default; aborted still skipped', () => {
+  // 输出截断：内容写了一半被 max output tokens 掐断，默认规则继续（maxAttempts: 0 不限次）
+  const a = decideTurnEnd(newSessionState(), 'max-tokens', eff(), 1000)
+  assert.equal(a.type, 'schedule')
+  assert.equal(a.rule.id, 'r-max-tokens')
+  assert.equal(a.compact, false)
+  assert.equal(a.override, null)
+  // 用户主动中止依旧不续（issue #6 注意事项）
+  const b = decideTurnEnd(newSessionState(), 'aborted', eff(), 1000)
+  assert.equal(b.type, 'skip')
+  assert.equal(b.reason, 'reason-not-retryable')
+})
+
+test('firstMatchingRule: max-tokens rule matches only kind=max-tokens; status rules never match it', () => {
+  const rules = [{ id: 'mt', when: 'max-tokens', action: 'continue', maxAttempts: 0 }]
+  assert.equal(firstMatchingRule(rules, 'max-tokens', { cls: undefined }, {}).id, 'mt')
+  assert.equal(firstMatchingRule(rules, 'error', { cls: 'server' }, {}), null)
+  assert.equal(firstMatchingRule(rules, 'interrupted', { cls: undefined }, {}), null)
+  // status 规则只对 kind=error 生效：截断轮没有结构化 failure，不硬凑
+  const st = [{ id: 's', when: 'status', action: 'continue', codes: '529', maxAttempts: 0 }]
+  assert.equal(firstMatchingRule(st, 'max-tokens', { cls: undefined }, {}, undefined), null)
+})
+
+test('decideTurnEnd: capped max-tokens rule falls through to any; global cap still guards', () => {
+  const rules = [
+    { id: 'mt', when: 'max-tokens', action: 'continue', maxAttempts: 1 },
+    { id: 'any', when: 'any', action: 'continue', maxAttempts: 0 },
+  ]
+  const e = eff({ rules })
+  const st = newSessionState()
+  assert.equal(decideTurnEnd(st, 'max-tokens', e, 1000).rule.id, 'mt')
+  st.ruleAttempts = { mt: 1 } // mt 用尽 → 落到 any 兜底
+  const b = decideTurnEnd(st, 'max-tokens', e, 1000)
+  assert.equal(b.type, 'schedule')
+  assert.equal(b.rule.id, 'any')
+  // 全局上限对 max-tokens 同样生效（防模型每轮都写超长的死循环）
+  const st3 = newSessionState(); st3.attempts = DEFAULTS.maxAttempts
+  assert.equal(decideTurnEnd(st3, 'max-tokens', eff(), 1000).type, 'cap')
+})
+
+test('sequence: repeated max-tokens truncations keep scheduling until global cap; completed resets', () => {
+  const st = newSessionState()
+  const e = eff({ maxAttempts: 3 })
+  for (let i = 0; i < 3; i++) {
+    const a = decideTurnEnd(st, 'max-tokens', e, i * 100000)
+    assert.equal(a.type, 'schedule', `iteration ${i}`)
+    assert.equal(a.rule.id, 'r-max-tokens')
+    assert.equal(a.attempt, i + 1)
+    st.attempts = a.attempt
+    if (a.rule) st.ruleAttempts[a.rule.id] = (st.ruleAttempts[a.rule.id] || 0) + 1
+  }
+  assert.equal(decideTurnEnd(st, 'max-tokens', e, 999999).type, 'cap')
+  assert.equal(decideTurnEnd(st, 'completed', e, 9999999).type, 'reset')
+  st.attempts = 0
+  assert.equal(decideTurnEnd(st, 'max-tokens', e, 99999999).type, 'schedule')
 })

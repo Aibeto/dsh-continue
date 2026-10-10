@@ -4,10 +4,11 @@
  * dsh-plugin-dsh-continue — Host half
  *
  * Auto-resume interrupted agent runs. When a session's turn ends in a
- * transport/connection error (`turn/end` reason `error`) or is closed as a
- * crash-orphan (`interrupted`), the plugin re-sends the configured prompt
- * (default "继续") to the SAME live session via `agent.followup(...)`, so a
- * flapping transport no longer forces the user to type 继续 by hand.
+ * transport/connection error (`turn/end` reason `error`), is closed as a
+ * crash-orphan (`interrupted`), or is truncated by the output limit
+ * (`max-tokens`), the plugin re-sends the configured prompt (default "继续")
+ * to the SAME live session via `agent.followup(...)`, so a flapping transport
+ * no longer forces the user to type 继续 by hand.
  *
  * Idempotency stays the agent's own responsibility — its system prompt
  * already forces "an interrupted tool call with no recorded result is only
@@ -54,11 +55,12 @@ const PERSESSION_TAIL = 20
 // （maxAttempts>0 且该规则本簇尝试次数达标）后自动跳到下一条。
 // when：rate-limit（429/限流）| quota（额度耗尽）| auth（鉴权失败）|
 //       context（上下文超限）| server（5xx）| transport（传输/网络错误）|
-//       interrupted（崩溃孤儿轮）| status（自定义状态码，见 parseCodes）| any（任意兜底）
+//       interrupted（崩溃孤儿轮）| max-tokens（输出截断）|
+//       status（自定义状态码，见 parseCodes）| any（任意兜底）
 // action：continue（按原模型继续）| continue-with（换到指定 provider/model 继续）|
 //         compact（压缩上下文后继续；无可压缩区间/压缩失败则停止并通知）|
 //         stop（停止自动续跑并通知会话）
-const RULE_WHENS = ['rate-limit', 'quota', 'auth', 'context', 'server', 'transport', 'interrupted', 'status', 'any']
+const RULE_WHENS = ['rate-limit', 'quota', 'auth', 'context', 'server', 'transport', 'interrupted', 'max-tokens', 'status', 'any']
 const RULE_ACTIONS = ['continue', 'continue-with', 'compact', 'stop']
 const WHEN_LABELS = {
   'rate-limit': '限流（429）',
@@ -68,6 +70,7 @@ const WHEN_LABELS = {
   server: '服务端错误（5xx）',
   transport: '传输/网络错误',
   interrupted: '崩溃孤儿轮',
+  'max-tokens': '输出截断（max-tokens）',
   status: '自定义状态码',
   any: '任意失败',
 }
@@ -78,6 +81,7 @@ const DEFAULT_RULES = [
   { id: 'r-auth',        when: 'auth',        action: 'stop',     provider: '', model: '', maxAttempts: 0 },
   { id: 'r-context',     when: 'context',     action: 'compact',  provider: '', model: '', maxAttempts: 2 },
   { id: 'r-interrupted', when: 'interrupted', action: 'continue', provider: '', model: '', maxAttempts: 0 },
+  { id: 'r-max-tokens',  when: 'max-tokens',  action: 'continue', provider: '', model: '', maxAttempts: 0 },
   { id: 'r-any',         when: 'any',         action: 'continue', provider: '', model: '', maxAttempts: 0 },
 ]
 
@@ -182,6 +186,7 @@ function reasonKind(reason) {
 /** Map a failure class (or turn kind) onto a rule `when` token. */
 function classToWhen(kind, cls) {
   if (kind === 'interrupted') return 'interrupted'
+  if (kind === 'max-tokens') return 'max-tokens'
   if (kind === 'error') {
     if (cls && cls.cls === 'unknown') return 'transport'
     if (cls && cls.cls) return cls.cls
@@ -193,8 +198,9 @@ function classToWhen(kind, cls) {
  * First matching, not-yet-exhausted rule (array order = priority; first match
  * wins). A rule is exhausted when maxAttempts > 0 and this cluster already used
  * that many continues under it. `when: 'status'` rules carry a user-defined
- * `codes` list and only ever match kind=error turns (a crash-orphan turn has no
- * structured failure to match against). Pure; unit-tested via __internals.
+ * `codes` list and only ever match kind=error turns (a crash-orphan or
+ * max-tokens turn has no structured failure to match against). Pure;
+ * unit-tested via __internals.
  */
 function firstMatchingRule(rules, kind, cls, ruleAttempts, failure) {
   const when = classToWhen(kind, cls)
@@ -346,8 +352,9 @@ function newSessionState() {
 function decideTurnEnd(st, kind, eff, now, failure) {
   if (kind === 'completed') return { type: 'reset' }
   if (kind === undefined) return { type: 'noop' }
-  // 只有 error（结构化失败）与 interrupted（崩溃孤儿）参与规则匹配；其余结束原因一律不续
-  if (kind !== 'error' && kind !== 'interrupted') return { type: 'skip', reason: 'reason-not-retryable', kind }
+  // error（结构化失败）、interrupted（崩溃孤儿）与 max-tokens（输出截断）参与规则
+  // 匹配；其余结束原因（如 aborted 用户主动中止）一律不续
+  if (kind !== 'error' && kind !== 'interrupted' && kind !== 'max-tokens') return { type: 'skip', reason: 'reason-not-retryable', kind }
   if (st.compacting) return { type: 'skip', reason: 'compacting' }
   const cls = kind === 'error' ? classifyFailure(failure) : { cls: undefined, status: undefined, code: undefined }
   const rule = firstMatchingRule(eff.rules, kind, cls, st.ruleAttempts, failure)
