@@ -79,6 +79,7 @@ const ZH = {
   when_server: '服务端错误（5xx）',
   when_transport: '传输 / 网络错误',
   when_interrupted: '崩溃孤儿轮',
+  when_maxTokens: '输出截断（max-tokens）',
   when_status: '自定义状态码',
   when_any: '任意失败（兜底）',
   ruleCodesLabel: '状态码列表',
@@ -89,7 +90,7 @@ const ZH = {
   act_stop: '停止并通知',
   enabled: '启用自动续跑',
   promptLabel: '续跑 prompt',
-  promptHint: '检测到传输错误/崩溃孤儿轮时，向同一会话投递的文本',
+  promptHint: '检测到传输错误/崩溃孤儿轮/输出截断时，向同一会话投递的文本',
   maxAttemptsLabel: '续跑上限（次）',
   maxAttemptsHint: '同一会话在一次失败簇内最多续跑次数；成功一轮后归零',
   cooldownLabel: '冷却（毫秒）',
@@ -127,7 +128,7 @@ const ZH = {
   loading: '…',
   now: '刚刚',
   operationFailed: '操作失败',
-  hint: '当某一轮以传输错误收尾或被关成崩溃孤儿，插件自动向同一会话再投一次「续跑 prompt」。是否重发副作用工具由 agent 自身判断，插件只管上限/冷却/退避护栏。',
+  hint: '当某一轮以传输错误收尾、被关成崩溃孤儿或输出被 max-tokens 截断，插件自动向同一会话再投一次「续跑 prompt」。是否重发副作用工具由 agent 自身判断，插件只管上限/冷却/退避护栏。',
 }
 
 const EN = {
@@ -153,6 +154,7 @@ const EN = {
   when_server: 'Server error (5xx)',
   when_transport: 'Transport / network error',
   when_interrupted: 'Crash-orphan turn',
+  when_maxTokens: 'Output truncated (max-tokens)',
   when_status: 'Custom status codes',
   when_any: 'Any failure (fallback)',
   ruleCodesLabel: 'Status codes',
@@ -163,7 +165,7 @@ const EN = {
   act_stop: 'Stop and notify',
   enabled: 'Enable auto-continue',
   promptLabel: 'Continue prompt',
-  promptHint: 'Text re-sent to the same session on transport error / crash-orphan turn',
+  promptHint: 'Text re-sent to the same session on transport error / crash-orphan turn / output truncation',
   maxAttemptsLabel: 'Max attempts',
   maxAttemptsHint: 'Max continues per session in one failure cluster; resets on a completed turn',
   cooldownLabel: 'Cooldown (ms)',
@@ -201,7 +203,7 @@ const EN = {
   loading: '…',
   now: 'now',
   operationFailed: 'Operation failed',
-  hint: 'When a turn ends in a transport error or is closed as a crash-orphan, the plugin re-sends the continue prompt to the same session. Whether to re-issue a side-effecting tool is the agent own call; this plugin only enforces cap/cooldown/backoff.',
+  hint: 'When a turn ends in a transport error, is closed as a crash-orphan, or is truncated by the output limit, the plugin re-sends the continue prompt to the same session. Whether to re-issue a side-effecting tool is the agent own call; this plugin only enforces cap/cooldown/backoff.',
 }
 
 // ── Pure helpers ────────────────────────────────────────────────────────
@@ -366,8 +368,8 @@ function SettingsSection({ t }) {
       h('input', { type: 'checkbox', checked: getter(), onChange: e => setter(e.target.checked) }), label)
 
     // ── 规则编辑 ──
-    const WHEN_KEYS = { 'rate-limit': 'when_rateLimit', quota: 'when_quota', auth: 'when_auth', context: 'when_context', server: 'when_server', transport: 'when_transport', interrupted: 'when_interrupted', status: 'when_status', any: 'when_any' }
-    const RULE_WHEN_VALUES = ['rate-limit', 'quota', 'auth', 'context', 'server', 'transport', 'interrupted', 'status', 'any']
+    const WHEN_KEYS = { 'rate-limit': 'when_rateLimit', quota: 'when_quota', auth: 'when_auth', context: 'when_context', server: 'when_server', transport: 'when_transport', interrupted: 'when_interrupted', 'max-tokens': 'when_maxTokens', status: 'when_status', any: 'when_any' }
+    const RULE_WHEN_VALUES = ['rate-limit', 'quota', 'auth', 'context', 'server', 'transport', 'interrupted', 'max-tokens', 'status', 'any']
     const RULE_ACTION_VALUES = ['continue', 'continue-with', 'compact', 'stop']
     const updateRule = (idx, patch) => setRules(rs => (rs || []).map((r, i2) => i2 === idx ? { ...r, ...patch } : r))
     const moveRule = (idx, dir) => setRules(rs => {
